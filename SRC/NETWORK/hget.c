@@ -100,6 +100,8 @@ typedef unsigned char bool;
 #define TCPFLAGS_USE_TLS 4
 #define TCPFLAGS_VERIFY_CERTIFICATE 8
 
+#define MAX_REDIRECTIONS 10
+
 enum TcpipUnapiFunctions {
     UNAPI_GET_INFO = 0,
     TCPIP_GET_CAPAB = 1,
@@ -140,12 +142,18 @@ enum TcpipErrorCodes {
 
 const char* strTitle=
     "HTTP file downloader 1.3\r\n"
-    "By Oduvaldo (ducasp@gmail.com) 07/2019 Based on HGET 1.1 by Konamiman\r\n"
+    "By Oduvaldo (ducasp@gmail.com) 7/2019\r\n"
+    "Based on HGET 1.1 by Konamiman\r\n"
     "\r\n";
 
-const char* strUsage=
+const char* strUseQuestionMarkForHelp=
+    "\r\nFor extended help: hget ?\r\n";
+
+const char* strShortUsage=
     "Usage: hget <file URL>|<local file with the URL>|con [/l:<local file name>]\r\n"
-    "  [/n] [/t] [/c] [/v] [/h] [/x:<headers file name>] [/a:<user>:<password>]\r\n"
+    "  [/n] [/t] [/c] [/v] [/h] [/x:<headers file name>] [/a:<user>:<password>]\r\n";
+
+const char* strLongUsage=
     "\r\n"
     "/c: Continue downloading a partially downloaded file.\r\n"
     "/v: Verbose mode, shows all the HTTP headers sent and received.\r\n"
@@ -157,9 +165,11 @@ const char* strUsage=
     "\r\n"
     "If no local file name is specified, the name is taken from the\r\n"
     "last part of the URL. If the URL ends with a slash or has no\r\n"
-    "slashes, then INDEX.HTM is used.\r\n"    
+    "slashes, then INDEX.HTM is used.\r\n"
+    "\r\n"
     "If an existing local text file is specified instead of an URL,\r\n"
     "then the URL is read from that file (useful for very large URLs).\r\n"
+    "\r\n"
     "If \"con\" is specified instead of an URL, the name is read from the console\r\n"
     "(useful for very large URLs or for redirecting, e.g. \"type url.txt|hget con\")\r\n"
     "\r\n"
@@ -169,6 +179,29 @@ const char* strInvParam = "Invalid parameter";
 const char* strNoNetwork = "No network connection available";
 const char* strCRLF = "\r\n";
 const char* strWwwAuthenticate = "WWW-Authenticate";
+#define TCP_CONN_FAILURE_KNOWN_REASONS 20
+const char* strConnFailureReasons[21] = {
+	"Unknow failure opening connection\r\n",
+	"This connection has never been used since the implementation was initialized.\r\n",
+	"The TCPIP_TCP_CLOSE method was called.\r\n",
+	"The TCPIP_TCP_ABORT method was called.\r\n",
+	"A RST segment was received (the connection was refused or aborted by the remote host).\r\n",
+	"The user timeout expired.\r\n",
+	"The connection establishment timeout expired.\r\n",
+	"Network connection was lost while the TCP connection was open.\r\n",
+	"ICMP \"Destination unreachable\" message received.\r\n",
+	"TLS: The server did not provide a certificate.\r\n",
+	"TLS: Invalid server certificate.\r\n",
+	"TLS: Invalid server certificate (the host name didn't match).\r\n",
+	"TLS: Invalid server certificate (expired).\r\n",
+	"TLS: Invalid server certificate (self-signed).\r\n",
+	"TLS: Invalid server certificate (untrusted root).\r\n",
+	"TLS: Invalid server certificate (revoked).\r\n",
+	"TLS: Invalid server certificate (invalid certificate authority).\r\n",
+	"TLS: Invalid server certificate (invalid TLS version or cypher suite).\r\n",
+	"TLS: Our certificate was rejected by the peer.\r\n",
+	"TLS: Other error.\r\n",
+	"An error that is unknown to this software occurred...\r\n"};
 
 
     /* Variables */
@@ -235,6 +268,7 @@ bool useHttps = false;
 bool mustCheckCertificate = true;
 bool mustCheckHostName = true;
 bool safeTlsIsSupported = true;
+byte redirectionRequests = 0;
 
     /* Some handy defines */
 
@@ -250,10 +284,11 @@ bool safeTlsIsSupported = true;
 
 int NoParameters();
 void PrintTitle();
-void PrintUsageAndEnd();
+void PrintUsageAndEnd(bool printLongUsage);
 void Terminate(const char* errorMessage);
 void CheckDosVersion();
 void InitializeTcpipUnapi();
+bool LongHelpRequested();
 void ProcessParameters();
 void ProcessUrl(char* url, byte isRedirection);
 void ProcessOptions();
@@ -346,7 +381,11 @@ int main(char** argv, int argc)
 
     PrintTitle();
     if(NoParameters()) {
-        PrintUsageAndEnd();
+        PrintUsageAndEnd(false);
+    }
+    if(LongHelpRequested()) 
+    {
+        PrintUsageAndEnd(true);
     }
 
     DisableAutoAbort();
@@ -398,9 +437,10 @@ void PrintTitle()
 }
 
 
-void PrintUsageAndEnd()
+void PrintUsageAndEnd(bool printLongUsage)
 {
-    print(strUsage);
+    print(strShortUsage);
+    print(printLongUsage ? strLongUsage : strUseQuestionMarkForHelp);
     DosCall(0, &regs, REGS_MAIN, REGS_NONE);
 }
 
@@ -475,6 +515,12 @@ void InitializeTcpipUnapi()
     TcpConnectionParameters->userTimeout = 0;
     TcpConnectionParameters->flags = 0;
     debug("TCP/IP UNAPI initialized OK");
+}
+
+
+bool LongHelpRequested()
+{
+    return strcmpi(arguments[0], "?") == 0;
 }
 
 
@@ -577,26 +623,36 @@ void ProcessUrl(char* url, byte isRedirection)
 		TcpConnectionParameters->remotePort = HTTP_DEFAULT_PORT;
 		TcpConnectionParameters->flags = 0 ;
         if(isRedirection) {
-			pointer = FindFirstSlash(url+7);
-			if ((pointer)&&(strncmpi(url+7, domainName, (pointer-url-7))))
+			if (useHttps)
 				redirectionUrlIsNewDomainName = 1;
 			else
-				redirectionUrlIsNewDomainName = 0;
+			{
+				pointer = FindFirstSlash(url+7);
+				if ((pointer)&&(strncmpi(url+7, domainName, (pointer-url-7))))
+					redirectionUrlIsNewDomainName = 1;
+				else
+					redirectionUrlIsNewDomainName = 0;
+			}
         }
         strcpy(domainName, url + 7);
+		useHttps = false;
     } else if((TlsIsSupported)&&(StringStartsWith(url, "https://"))) {
         if(isRedirection) {
-			pointer = FindFirstSlash(url+8);
-			if ((pointer)&&(strncmpi(url+8, domainName, (pointer-url-8))))
+			if (!useHttps)
 				redirectionUrlIsNewDomainName = 1;
 			else
-				redirectionUrlIsNewDomainName = 0;
+			{
+				pointer = FindFirstSlash(url+8);
+				if ((pointer)&&(strncmpi(url+8, domainName, (pointer-url-8))))
+					redirectionUrlIsNewDomainName = 1;
+				else
+					redirectionUrlIsNewDomainName = 0;
+			}
         }
         strcpy(domainName, url + 8);
 		useHttps = true;
 		TcpConnectionParameters->remotePort = HTTPS_DEFAULT_PORT;
-		TcpConnectionParameters->flags = TcpConnectionParameters->flags | TCPFLAGS_USE_TLS ;
-		
+		TcpConnectionParameters->flags = TcpConnectionParameters->flags | TCPFLAGS_USE_TLS ;		
     } else if(ContainsProtocolSpecifier(url)) {
         if(isRedirection) {
             Terminate("Redirection request received, but the new URL protocol is not HTTP.");
@@ -809,6 +865,7 @@ char* FindFirstSemicolon(char* string)
 void DoHttpWork()
 {
     authenticationRequested = 0;
+	redirectionRequests = 0;
 
     ResetTcpBuffer();
     ResolveServerName();
@@ -851,7 +908,7 @@ void DoHttpWork()
 
 void PrintRedirectionInformation()
 {
-    printf("* Redirecting to: %s\r\n\r\n", redirectionFullLocation);
+    printf("* Redirecting to: %s\r\n\r\n", redirectionFullLocation);	
 }
 
 
@@ -1058,6 +1115,9 @@ void ProcessResponseStatus()
         continueReceived = 1;
     } else if(responseStatusCodeFirstDigit == 3) {
         redirectionRequested = 1;
+		++redirectionRequests;
+		if (redirectionRequests>MAX_REDIRECTIONS)
+			Terminate ("ERROR: Too many redirects!\r\n");
     } else if(responseStatusCodeFirstDigit == 2 && continueDownloading && responseStatusCode != 206) {
         Terminate("ERROR: Resume download was requested, but the server started a new download.");
     } else if(responseStatusCodeFirstDigit != 2) {
@@ -1497,18 +1557,17 @@ void UpdateReceivingMessage()
 
     if(!localFileIsConsole) {
 		if (contentLength)
-		{
-			if (currentBlock>=blockSize)
-			{
-				currentBlock-=blockSize;
-				print("=");
-			}
-
+		{			
 			if (isFirstUpdate)
 			{
 				isFirstUpdate=false;
-				print("\r[                         ]\x1d\x1d\x1d\x1d\x1d\x1d\x1d\x1d\x1d\x1d\x1d\x1d\x1d\x1d\x1d\x1d\x1d\x1d\x1d\x1d\x1d\x1d\x1d\x1d\x1d\x1d");				
+				print("\r[                         ]\r\x1c");
 			}
+			while (currentBlock>=blockSize)
+			{
+				currentBlock-=blockSize;
+				print("=");
+			}			
 		}
 		else
 		{
@@ -1649,73 +1708,12 @@ void OpenTcpConnection()
         Terminate(strNoNetwork);
     } else if(regs.Bytes.A != 0) {
         sprintf(Buffer, "Unexpected error when opening TCP connection (%i)", regs.Bytes.A);
-		if ((useHttps)&&(regs.Bytes.A == ERR_NO_CONN)) //C should have the reason
+		if (regs.Bytes.A == ERR_NO_CONN) //C should have the reason
 		{
-			switch (regs.Bytes.C)
-			{
-				case 0:
-					printf("Unknow failure opening connection\r\n");
-				break;
-				case 1:
-					printf("This connection has never been used since the implementation was initialized.\r\n");
-				break;
-				case 2:
-					printf("The TCPIP_TCP_CLOSE method was called.\r\n");
-				break;
-				case 3:
-					printf("The TCPIP_TCP_ABORT method was called.\r\n");
-				break;
-				case 4:
-					printf("A RST segment was received (the connection was refused or aborted by the remote host).\r\n");
-				break;
-				case 5:
-					printf("The user timeout expired.\r\n");
-				break;
-				case 6:
-					printf("The connection establishment timeout expired.\r\n");
-				break;
-				case 7:
-					printf("Network connection was lost while the TCP connection was open.\r\n");
-				break;
-				case 8:
-					printf("ICMP \"Destination unreachable\" message received.\r\n");
-				break;
-				case 9:
-					printf("TLS: The server did not provide a certificate.\r\n");
-				break;
-				case 10:
-					printf("TLS: Invalid server certificate.\r\n");
-				break;
-				case 11:
-					printf("TLS: Invalid server certificate (the host name didn't match).\r\n");
-				break;
-				case 12:
-					printf("TLS: Invalid server certificate (expired).\r\n");
-				break;
-				case 13:
-					printf("TLS: Invalid server certificate (self-signed).\r\n");
-				break;
-				case 14:
-					printf("TLS: Invalid server certificate (untrusted root).\r\n");
-				break;
-				case 15:
-					printf("TLS: Invalid server certificate (revoked).\r\n");
-				break;
-				case 16:
-					printf("TLS: Invalid server certificate (invalid certificate authority).\r\n");
-				break;
-				case 17:
-					printf("TLS: Invalid server certificate (invalid TLS version or cypher suite).\r\n");
-				break;
-				case 18:
-					printf("TLS: Our certificate was rejected by the peer.\r\n");
-				break;
-				case 19:
-					printf("TLS: Other error.\r\n");
-				default:
-					printf("An error that is unknown to this software occurred...\r\n");
-				break;
-			}
+			if (regs.Bytes.C >= TCP_CONN_FAILURE_KNOWN_REASONS)
+				printf("\r\n%s",strConnFailureReasons[TCP_CONN_FAILURE_KNOWN_REASONS]);
+			else
+				printf("\r\n%s",strConnFailureReasons[regs.Bytes.C]);
 		}
         Terminate(Buffer);
     }
@@ -1739,7 +1737,14 @@ void OpenTcpConnection()
     if(regs.Bytes.A != 0) {
         debug2("Error connecting: %i\r\n", regs.Bytes.A);
         Terminate("Could not establish a connection to the server");
-    }
+		if (regs.Bytes.A == ERR_NO_CONN)
+		{
+			if (regs.Bytes.C >= TCP_CONN_FAILURE_KNOWN_REASONS)
+				printf("\r\n%s",strConnFailureReasons[TCP_CONN_FAILURE_KNOWN_REASONS]);
+			else
+				printf("\r\n%s",strConnFailureReasons[regs.Bytes.C]);
+		}
+    }	
 
     print("OK\r\n\r\n");
 }
